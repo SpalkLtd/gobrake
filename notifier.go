@@ -106,7 +106,7 @@ func (n *Notifier) Notify(e interface{}, req *http.Request) {
 // MyCaller returns the caller of the function that called it :)
 func MyCaller() string {
 	// skip 3 levels to get to the caller of whoever called Caller()
-	if _, file, line, ok := runtime.Caller(3); ok {
+	if _, file, line, ok := runtime.Caller(2); ok {
 		parts := strings.Split(file, "/")
 		return parts[len(parts)-1] + ":" + strconv.Itoa(line)
 	}
