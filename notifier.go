@@ -1,4 +1,4 @@
-package gobrake // import "gopkg.in/airbrake/gobrake.v2"
+package gobrake
 
 import (
 	"bytes"
@@ -9,6 +9,8 @@ import (
 	"net"
 	"net/http"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -94,8 +96,21 @@ func (n *Notifier) AddFilter(fn filter) {
 
 // Notify notifies Airbrake about the error.
 func (n *Notifier) Notify(e interface{}, req *http.Request) {
+	fmt.Print(time.Now().Format("2006/01/02 15:04:05") + " " + MyCaller() + " ")
+	fmt.Print(e)
+	fmt.Print("\n")
 	notice := n.Notice(e, req, 1)
 	n.SendNoticeAsync(notice)
+}
+
+// MyCaller returns the caller of the function that called it :)
+func MyCaller() string {
+	// skip 3 levels to get to the caller of whoever called Caller()
+	if _, file, line, ok := runtime.Caller(3); ok {
+		parts := strings.Split(file, "/")
+		return parts[len(parts)-1] + ":" + strconv.Itoa(line)
+	}
+	return "unknown"
 }
 
 // Notice returns Aibrake notice created from error and request. depth
