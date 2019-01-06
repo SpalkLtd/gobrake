@@ -8,25 +8,33 @@
 package main
 
 import (
-	"errors"
+    "errors"
 
-	"gopkg.in/airbrake/gobrake.v2"
+    "github.com/airbrake/gobrake"
 )
 
-var airbrake = gobrake.NewNotifier(1234567, "FIXME")
+var airbrake = gobrake.NewNotifierWithOptions(&gobrake.NotifierOptions{
+    ProjectId: 123456,
+    ProjectKey: "FIXME",
+    Environment: "production",
+})
 
 func init() {
-	airbrake.AddFilter(func(notice *gobrake.Notice) *gobrake.Notice {
-		notice.Context["environment"] = "production"
-		return notice
-	})
+    airbrake.AddFilter(func(notice *gobrake.Notice) *gobrake.Notice {
+        notice.Params["user"] = map[string]string{
+            "id": "1",
+            "username": "johnsmith",
+            "name": "John Smith",
+        }
+        return notice
+    })
 }
 
 func main() {
-	defer airbrake.Close()
-	defer airbrake.NotifyOnPanic()
+    defer airbrake.Close()
+    defer airbrake.NotifyOnPanic()
 
-	airbrake.Notify(errors.New("operation failed"), nil)
+    airbrake.Notify(errors.New("operation failed"), nil)
 }
 ```
 
@@ -34,14 +42,43 @@ func main() {
 
 ```go
 airbrake.AddFilter(func(notice *gobrake.Notice) *gobrake.Notice {
-	if notice.Context["environment"] == "development" {
-		// Ignore notices in development environment.
-		return nil
-	}
-	return notice
+    if notice.Context["environment"] == "development" {
+        // Ignore notices in development environment.
+        return nil
+    }
+    return notice
 })
+```
+
+## Setting severity
+
+[Severity](https://airbrake.io/docs/airbrake-faq/what-is-severity/) allows
+categorizing how severe an error is. By default, it's set to `error`. To
+redefine severity, simply overwrite `context/severity` of a notice object. For
+example:
+
+```go
+notice := airbrake.Notice("operation failed", nil, 3)
+notice.Context["severity"] = "critical"
+airbrake.Notify(notice, nil)
 ```
 
 ## Logging
 
 You can use [glog fork](https://github.com/airbrake/glog) to send your logs to Airbrake.
+
+## Sending requests stats
+
+In order to collect some basic requests stats you can instrument your application using `Notifier.NotifyRequest` API:
+
+```go
+notifier.NotifyRequest(&gobrake.RequestInfo{
+    Method:     "GET",
+    Route:      "/hello/:name",
+    StatusCode: http.StatusOK,
+    Start:      startTime,
+    End:        time.Now(),
+})
+```
+
+We also prepared HTTP middlewares for [Gin](examples/gin) and [Beego](examples/beego) users.

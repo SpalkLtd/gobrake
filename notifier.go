@@ -8,38 +8,57 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"path/filepath"
+	"os"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
-const defaultAirbrakeHost = "https://airbrake.io"
 const waitTimeout = 5 * time.Second
+
+const httpEnhanceYourCalm = 420
 const httpStatusTooManyRequests = 429
 
+const maxNoticeLen = 64 * 1024
+
 var (
-	errClosed      = errors.New("gobrake: notifier is closed")
-	errRateLimited = errors.New("gobrake: rate limited")
+	errClosed             = errors.New("gobrake: notifier is closed")
+	errQueueFull          = errors.New("gobrake: queue is full (error is dropped)")
+	errUnauthorized       = errors.New("gobrake: unauthorized: invalid project id or key")
+	errAccountRateLimited = errors.New("gobrake: account is rate limited")
+	errIPRateLimited      = errors.New("gobrake: IP is rate limited")
+	errNoticeTooBig       = errors.New("gobrake: notice exceeds 64KB max size limit")
 )
 
-var httpClient = &http.Client{
-	Transport: &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
-		Dial: (&net.Dialer{
-			Timeout:   15 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}).Dial,
-		TLSHandshakeTimeout: 10 * time.Second,
-		TLSClientConfig: &tls.Config{
-			ClientSessionCache: tls.NewLRUClientSessionCache(1024),
-		},
-		MaxIdleConnsPerHost:   10,
-		ResponseHeaderTimeout: 10 * time.Second,
-	},
-	Timeout: 10 * time.Second,
+var (
+	httpClientOnce sync.Once
+	httpClient     *http.Client
+)
+
+func defaultHTTPClient() *http.Client {
+	httpClientOnce.Do(func() {
+		httpClient = &http.Client{
+			Transport: &http.Transport{
+				Proxy: http.ProxyFromEnvironment,
+				Dial: (&net.Dialer{
+					Timeout:   15 * time.Second,
+					KeepAlive: 30 * time.Second,
+				}).Dial,
+				TLSHandshakeTimeout: 10 * time.Second,
+				TLSClientConfig: &tls.Config{
+					ClientSessionCache: tls.NewLRUClientSessionCache(1024),
+				},
+				MaxIdleConnsPerHost:   10,
+				ResponseHeaderTimeout: 10 * time.Second,
+			},
+			Timeout: 10 * time.Second,
+		}
+	})
+	return httpClient
 }
 
 var buffers = sync.Pool{
@@ -50,47 +69,97 @@ var buffers = sync.Pool{
 
 type filter func(*Notice) *Notice
 
-type Notifier struct {
-	// http.Client that is used to interact with Airbrake API.
-	Client *http.Client
+type NotifierOptions struct {
+	// Airbrake project id.
+	ProjectId int64
+	// Airbrake project key.
+	ProjectKey string
+	// Airbrake host name. Default is https://airbrake.io.
+	Host string
 
-	projectId       int64
-	projectKey      string
+	// Environment such as production or development.
+	Environment string
+	// Git revision. Default is SOURCE_VERSION on Heroku.
+	Revision string
+	// List of keys containing sensitive information that must be filtered out.
+	// Default is password, secret.
+	KeysBlacklist []interface{}
+
+	// http.Client that is used to interact with Airbrake API.
+	HTTPClient *http.Client
+}
+
+func (opt *NotifierOptions) init() {
+	if opt.Host == "" {
+		opt.Host = "https://api.airbrake.io"
+	}
+
+	if opt.Revision == "" {
+		// https://devcenter.heroku.com/changelog-items/630
+		opt.Revision = os.Getenv("SOURCE_VERSION")
+	}
+
+	if opt.KeysBlacklist == nil {
+		opt.KeysBlacklist = []interface{}{
+			regexp.MustCompile("password"),
+			regexp.MustCompile("secret"),
+		}
+	}
+
+	if opt.HTTPClient == nil {
+		opt.HTTPClient = defaultHTTPClient()
+	}
+}
+
+type Notifier struct {
+	opt             *NotifierOptions
 	createNoticeURL string
 
 	filters []filter
 
+	inFlight int32 // atomic
+	limit    chan struct{}
 	wg       sync.WaitGroup
-	noticeCh chan *Notice
-	closed   chan struct{}
+
+	routes *routeStats
+
+	rateLimitReset uint32 // atomic
+	_closed        uint32 // atomic
 }
 
-func NewNotifier(projectId int64, projectKey string) *Notifier {
+func NewNotifierWithOptions(opt *NotifierOptions) *Notifier {
+	opt.init()
+
 	n := &Notifier{
-		Client: httpClient,
+		opt: opt,
+		createNoticeURL: fmt.Sprintf("%s/api/v3/projects/%d/notices",
+			opt.Host, opt.ProjectId),
 
-		projectId:       projectId,
-		projectKey:      projectKey,
-		createNoticeURL: getCreateNoticeURL(defaultAirbrakeHost, projectId, projectKey),
+		limit: make(chan struct{}, 2*runtime.NumCPU()),
 
-		filters: []filter{noticeBacktraceFilter},
-
-		noticeCh: make(chan *Notice, 1000),
-		closed:   make(chan struct{}),
+		routes: newRouteStats(opt),
 	}
-	for i := 0; i < 10; i++ {
-		go n.worker()
+
+	n.AddFilter(newNotifierFilter(n))
+	n.AddFilter(gopathFilter)
+	n.AddFilter(gitFilter)
+
+	if len(opt.KeysBlacklist) > 0 {
+		n.AddFilter(NewBlacklistKeysFilter(opt.KeysBlacklist...))
 	}
+
 	return n
 }
 
-// Sets Airbrake host name. Default is https://airbrake.io.
-func (n *Notifier) SetHost(h string) {
-	n.createNoticeURL = getCreateNoticeURL(h, n.projectId, n.projectKey)
+func NewNotifier(projectId int64, projectKey string) *Notifier {
+	return NewNotifierWithOptions(&NotifierOptions{
+		ProjectId:  projectId,
+		ProjectKey: projectKey,
+	})
 }
 
-// AddFilter adds filter that can modify or ignore notice.
-func (n *Notifier) AddFilter(fn filter) {
+// AddFilter adds filter that can change notice or ignore it by returning nil.
+func (n *Notifier) AddFilter(fn func(*Notice) *Notice) {
 	n.filters = append(n.filters, fn)
 }
 
@@ -125,6 +194,13 @@ type sendResponse struct {
 
 // SendNotice sends notice to Airbrake.
 func (n *Notifier) SendNotice(notice *Notice) (string, error) {
+	if n.closed() {
+		return "", errClosed
+	}
+	return n.sendNotice(notice)
+}
+
+func (n *Notifier) sendNotice(notice *Notice) (string, error) {
 	for _, fn := range n.filters {
 		notice = fn(notice)
 		if notice == nil {
@@ -133,15 +209,31 @@ func (n *Notifier) SendNotice(notice *Notice) (string, error) {
 		}
 	}
 
+	if time.Now().Unix() < int64(atomic.LoadUint32(&n.rateLimitReset)) {
+		return "", errIPRateLimited
+	}
+
 	buf := buffers.Get().(*bytes.Buffer)
 	defer buffers.Put(buf)
 
 	buf.Reset()
-	if err := json.NewEncoder(buf).Encode(notice); err != nil {
+	err := json.NewEncoder(buf).Encode(notice)
+	if err != nil {
 		return "", err
 	}
 
-	resp, err := n.Client.Post(n.createNoticeURL, "application/json", buf)
+	if buf.Len() > maxNoticeLen {
+		return "", errNoticeTooBig
+	}
+
+	req, err := http.NewRequest("POST", n.createNoticeURL, buf)
+	if err != nil {
+		return "", err
+	}
+
+	req.Header.Set("Authorization", "Bearer "+n.opt.ProjectKey)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := n.opt.HTTPClient.Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -153,65 +245,59 @@ func (n *Notifier) SendNotice(notice *Notice) (string, error) {
 		return "", err
 	}
 
-	if resp.StatusCode != http.StatusCreated {
-		if resp.StatusCode == httpStatusTooManyRequests {
-			return "", errRateLimited
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		var sendResp sendResponse
+		err = json.NewDecoder(buf).Decode(&sendResp)
+		if err != nil {
+			return "", err
 		}
-		err := fmt.Errorf("gobrake: got response status=%q, wanted 201 CREATED", resp.Status)
-		return "", err
+		return sendResp.Id, nil
 	}
 
-	var sendResp sendResponse
-	err = json.NewDecoder(buf).Decode(&sendResp)
-	if err != nil {
-		return "", err
+	switch resp.StatusCode {
+	case http.StatusUnauthorized:
+		return "", errUnauthorized
+	case httpStatusTooManyRequests:
+		delayStr := resp.Header.Get("X-RateLimit-Delay")
+		delay, err := strconv.ParseInt(delayStr, 10, 64)
+		if err == nil {
+			atomic.StoreUint32(&n.rateLimitReset, uint32(time.Now().Unix()+delay))
+		}
+		return "", errIPRateLimited
+	case httpEnhanceYourCalm:
+		return "", errAccountRateLimited
 	}
 
-	return sendResp.Id, nil
+	err = fmt.Errorf("got unexpected response status=%q", resp.Status)
+	logger.Printf("SendNotice failed reporting notice=%q: %s", notice, err)
+	return "", err
 }
 
-func (n *Notifier) sendNotice(notice *Notice) {
-	if _, err := n.SendNotice(notice); err != nil && err != errRateLimited {
-		logger.Printf("gobrake failed reporting notice=%q: %s", notice, err)
-	}
-	n.wg.Done()
-}
-
-// SendNoticeAsync acts as SendNotice, but sends notice asynchronously
-// and pending notices can be flushed with Flush.
+// SendNoticeAsync is like SendNotice, but sends notice asynchronously.
+// Pending notices can be flushed with Flush.
 func (n *Notifier) SendNoticeAsync(notice *Notice) {
-	select {
-	case <-n.closed:
+	if n.closed() {
+		notice.Error = errClosed
 		return
-	default:
+	}
+
+	inFlight := atomic.AddInt32(&n.inFlight, 1)
+	if inFlight > 1000 {
+		atomic.AddInt32(&n.inFlight, -1)
+		notice.Error = errQueueFull
+		return
 	}
 
 	n.wg.Add(1)
-	select {
-	case n.noticeCh <- notice:
-	default:
-		n.wg.Done()
-		logger.Printf(
-			"notice=%q is ignored, because queue is full (len=%d)",
-			notice, len(n.noticeCh),
-		)
-	}
-}
+	go func() {
+		n.limit <- struct{}{}
 
-func (n *Notifier) worker() {
-	for {
-		select {
-		case notice := <-n.noticeCh:
-			n.sendNotice(notice)
-		case <-n.closed:
-			select {
-			case notice := <-n.noticeCh:
-				n.sendNotice(notice)
-			default:
-				return
-			}
-		}
-	}
+		notice.Id, notice.Error = n.sendNotice(notice)
+		atomic.AddInt32(&n.inFlight, -1)
+		n.wg.Done()
+
+		<-n.limit
+	}()
 }
 
 // NotifyOnPanic notifies Airbrake about the panic and should be used
@@ -219,6 +305,7 @@ func (n *Notifier) worker() {
 func (n *Notifier) NotifyOnPanic() {
 	if v := recover(); v != nil {
 		notice := n.Notice(v, nil, 3)
+		notice.Context["severity"] = "critical"
 		n.SendNotice(notice)
 		panic(v)
 	}
@@ -229,19 +316,20 @@ func (n *Notifier) Flush() {
 	n.waitTimeout(waitTimeout)
 }
 
-// Deprecated. Use CloseTimeout instead.
-func (n *Notifier) WaitAndClose(timeout time.Duration) error {
-	return n.CloseTimeout(timeout)
+func (n *Notifier) Close() error {
+	return n.CloseTimeout(waitTimeout)
 }
 
 // CloseTimeout waits for pending requests to finish and then closes the notifier.
 func (n *Notifier) CloseTimeout(timeout time.Duration) error {
-	select {
-	case <-n.closed:
-	default:
-		close(n.closed)
+	if !atomic.CompareAndSwapUint32(&n._closed, 0, 1) {
+		return nil
 	}
 	return n.waitTimeout(timeout)
+}
+
+func (n *Notifier) closed() bool {
+	return atomic.LoadUint32(&n._closed) == 1
 }
 
 func (n *Notifier) waitTimeout(timeout time.Duration) error {
@@ -259,37 +347,7 @@ func (n *Notifier) waitTimeout(timeout time.Duration) error {
 	}
 }
 
-func (n *Notifier) Close() error {
-	return n.CloseTimeout(waitTimeout)
-}
-
-func getCreateNoticeURL(host string, projectId int64, key string) string {
-	return fmt.Sprintf(
-		"%s/api/v3/projects/%d/notices?key=%s",
-		host, projectId, key,
-	)
-}
-
-func noticeBacktraceFilter(notice *Notice) *Notice {
-	v, ok := notice.Context["rootDirectory"]
-	if !ok {
-		return notice
-	}
-
-	dir, ok := v.(string)
-	if !ok {
-		return notice
-	}
-
-	dir = filepath.Join(dir, "src")
-	for i := range notice.Errors {
-		replaceRootDirectory(notice.Errors[i].Backtrace, dir)
-	}
-	return notice
-}
-
-func replaceRootDirectory(backtrace []StackFrame, rootDir string) {
-	for i := range backtrace {
-		backtrace[i].File = strings.Replace(backtrace[i].File, rootDir, "[PROJECT_ROOT]", 1)
-	}
+// NotifyRequest notifies Airbrake about the request.
+func (n *Notifier) NotifyRequest(req *RequestInfo) error {
+	return n.routes.NotifyRequest(req)
 }
