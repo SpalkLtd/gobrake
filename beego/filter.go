@@ -3,7 +3,7 @@ package beego
 import (
 	"time"
 
-	"github.com/airbrake/gobrake"
+	"github.com/SpalkLtd/gobrake"
 
 	"github.com/astaxie/beego"
 	"github.com/astaxie/beego/context"

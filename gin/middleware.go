@@ -4,7 +4,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/airbrake/gobrake"
+	"github.com/SpalkLtd/gobrake"
 	"github.com/gin-gonic/gin"
 )
 

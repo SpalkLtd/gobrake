@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/airbrake/gobrake"
+	"github.com/SpalkLtd/gobrake"
 )
 
 func BenchmarkSendNotice(b *testing.B) {

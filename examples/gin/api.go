@@ -4,8 +4,8 @@ import (
 	"flag"
 	"time"
 
-	"github.com/airbrake/gobrake"
-	ginbrake "github.com/airbrake/gobrake/gin"
+	"github.com/SpalkLtd/gobrake"
+	ginbrake "github.com/SpalkLtd/gobrake/gin"
 
 	"github.com/gin-gonic/gin"
 )

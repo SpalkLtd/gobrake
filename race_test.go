@@ -7,7 +7,7 @@ import (
 
 	. "github.com/onsi/ginkgo"
 
-	"github.com/airbrake/gobrake"
+	"github.com/SpalkLtd/gobrake"
 )
 
 var _ = Describe("Notifier", func() {
